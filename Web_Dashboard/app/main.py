@@ -5,14 +5,18 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 from pydantic import BaseModel
 from typing import Optional, List
-import math, time, random, json, os
+import math, time, json, os
 from collections import deque
-import anthropic
+import google.generativeai as genai
 
 app = FastAPI(title="EnvMonitor IoT")
 history = deque(maxlen=50)
-chat_client = anthropic.Anthropic() if os.environ.get("ANTHROPIC_API_KEY") else None
-CHAT_MODEL = "claude-haiku-4-5"
+
+# Configure Gemini API
+gemini_api_key = os.environ.get("GEMINI_API_KEY")
+if gemini_api_key:
+    genai.configure(api_key=gemini_api_key)
+CHAT_MODEL = "gemini-1.5-flash"
 
 @app.exception_handler(StarletteHTTPException)
 async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
@@ -20,17 +24,12 @@ async def custom_http_exception_handler(request: Request, exc: StarletteHTTPExce
         return FileResponse("app/static/404.html", status_code=404)
     return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
 
-# Real device data: set by POST /data/sensor (ESP32 Receiver Gateway), read by GET /data/latest.
+# Real device data
 last_device_data = None
 last_device_time = 0
-DEVICE_FRESH_WINDOW = 30  # seconds — how long a device reading is considered "live"
+DEVICE_FRESH_WINDOW = 30  # Seconds
 
-# Real device data: set by POST /data/sensor (ESP32 Receiver Gateway), read by GET /data/latest.
-last_device_data = None
-last_device_time = 0
-DEVICE_FRESH_WINDOW = 30  # seconds
-
-# 1. DATA ANALYSIS & CATEGORIZATION FUNCTION
+# 1. DATA ANALYSIS & TRANSLATION FUNCTION
 def analyze_sensor_data(d):
     # Analyze Soil Moisture
     soil_raw = d.get('soilAO', 4095)
@@ -41,9 +40,9 @@ def analyze_sensor_data(d):
     else:
         d['soilStatus'] = "Waterlogged"
 
-    # Analyze UV Voltage
+    # Analyze UV Index
     uv_voltage = d.get('uvVoltage', 0)
-    uv_index = int((uv_voltage or 0) / 0.1) # Assuming 0.1V roughly equals 1 UV Index
+    uv_index = int((uv_voltage or 0) / 0.1)
     d['uvIndex'] = min(uv_index, 11)
     if d['uvIndex'] <= 2:
         d['uvStatus'] = "Safe"
@@ -52,31 +51,28 @@ def analyze_sensor_data(d):
     else:
         d['uvStatus'] = "High risk - Avoid direct sun"
 
-    # Analyze Rain Sensor
+    # Analyze Rain Status
     rain_raw = d.get('rainAO', 4095)
     if rain_raw < 2500:
         d['rainStatus'] = "Raining"
     else:
         d['rainStatus'] = "Clear"
 
-    # Calculate Heat Index (Feels-like temperature)
+    # Calculate Heat Index
     temp = d.get('temperature', 0)
     hum = d.get('humidity', 0)
     if temp is not None and hum is not None and temp >= 26:
-        # Standard formula for Heat Index in Celsius
         d['heatIndex'] = round(temp + (0.5555 * (hum/100) * (temp - 14.5)), 1)
     else:
         d['heatIndex'] = temp
 
     return d
 
-# 2. FETCH LATEST DATA (REPLACING FAKE DATA)
+# 2. GET LATEST DATA (FALLBACK STATE)
 def latest_data():
-    # If valid data has been received from the ESP32, return it
     if last_device_data is not None:
         return last_device_data
     
-    # Fallback state: ESP32 hasn't connected yet
     return {
         "temperature": 0, "humidity": 0, "lux": 0,
         "rainDO": 1, "rainAO": 4095, "soilDO": 1, "soilAO": 4095,
@@ -89,7 +85,6 @@ def latest_data():
         "heatIndex": 0
     }
 
-# (Keep your existing BaseModel classes here...)
 class LoginData(BaseModel):
     email: str
     password: str
@@ -145,7 +140,6 @@ def get_latest(): return latest_data()
 @app.get("/data/history")
 def get_history(): return list(history)
 
-# 3. RECEIVE DATA FROM ESP32 GATEWAY
 @app.post("/data/sensor")
 def receive(data: SensorData):
     global last_device_data, last_device_time
@@ -156,7 +150,7 @@ def receive(data: SensorData):
         "source": "device",
     }
     
-    # Process raw data through the analysis function before saving it
+    # Process raw data through the analysis function
     entry = analyze_sensor_data(entry)
     
     last_device_data = entry
@@ -164,48 +158,65 @@ def receive(data: SensorData):
     history.append(entry)
     return {"status": "ok"}
 
+# 3. BUILD AI SYSTEM PROMPT
 def build_chat_system_prompt():
     d = latest_data()
     return (
-        "You are the EnvMonitor Assistant, a friendly helper built into a small IoT "
-        "environmental monitoring dashboard for a garden/farm. Answer questions about "
-        "the current conditions and give short, practical, plain-language advice. "
-        "Keep replies to 2-4 sentences unless the user asks for more detail. "
-        "If a question has nothing to do with the dashboard or the garden, answer briefly "
-        "and steer back to what you can help with.\n\n"
-        f"Live sensor readings (source: {d.get('source')}, as of {d.get('timestamp')}):\n"
-        f"- Temperature: {d.get('temperature')} °C\n"
-        f"- Humidity: {d.get('humidity')} %\n"
+        "You are the smart Environmental Assistant of the EnvMonitor IoT system, "
+        "powered by Google (Gemini) to help users monitor their garden. "
+        "Absolutely DO NOT reply with raw technical numbers. Use natural language instead.\n"
+        "- If the soil is dry, advise them to water it.\n"
+        "- If it is raining, remind them to cover things up.\n"
+        "- If the UV index is high, remind them to protect their skin.\n"
+        "- Keep your answers extremely concise, friendly, and maximum 3 sentences long.\n\n"
+        f"Current environmental conditions:\n"
+        f"- Temperature: {d.get('temperature')}°C (Feels like: {d.get('heatIndex')}°C)\n"
+        f"- Humidity: {d.get('humidity')}%\n"
         f"- Light: {d.get('lux')} lux\n"
-        f"- Soil dryness (raw analog, higher = drier): {d.get('soilAO')}\n"
-        f"- Rain sensor (raw analog): {d.get('rainAO')}\n"
-        f"- UV sensor voltage: {d.get('uvVoltage')} V\n"
+        f"- Soil: {d.get('soilStatus')}\n"
+        f"- Weather: {d.get('rainStatus')}\n"
+        f"- UV: {d.get('uvStatus')}\n"
     )
 
+# 4. GEMINI CHAT ENDPOINT
 @app.post("/api/chat")
 def chat(req: ChatRequest):
-    if chat_client is None:
+    if not gemini_api_key:
         def missing_key():
-            msg = "Chat is not configured yet — the server is missing an ANTHROPIC_API_KEY."
+            msg = "AI not connected — Please set GEMINI_API_KEY on the server."
             yield f"data: {json.dumps({'text': msg})}\n\n"
             yield "data: [DONE]\n\n"
         return StreamingResponse(missing_key(), media_type="text/event-stream")
 
     system_prompt = build_chat_system_prompt()
-    messages = [{"role": m.role, "content": m.content} for m in req.messages]
+    
+    # Initialize the model with system instructions
+    model = genai.GenerativeModel(
+        model_name=CHAT_MODEL,
+        system_instruction=system_prompt
+    )
+
+    # Convert message history to Gemini format (user / model)
+    gemini_history = []
+    if len(req.messages) > 1:
+        for m in req.messages[:-1]:
+            role = "model" if m.role in ["assistant", "model"] else "user"
+            gemini_history.append({"role": role, "parts": [m.content]})
+            
+    last_message = req.messages[-1].content if req.messages else ""
 
     def generate():
         try:
-            with chat_client.messages.stream(
-                model=CHAT_MODEL,
-                max_tokens=1024,
-                system=system_prompt,
-                messages=messages,
-            ) as stream:
-                for text in stream.text_stream:
-                    yield f"data: {json.dumps({'text': text})}\n\n"
-        except anthropic.APIError as e:
-            yield f"data: {json.dumps({'text': f'(Chat error: {e.message})'})}\n\n"
+            # Start chat session with historical context
+            chat_session = model.start_chat(history=gemini_history)
+            
+            # Send latest message and stream the response
+            response = chat_session.send_message(last_message, stream=True)
+            for chunk in response:
+                if chunk.text:
+                    yield f"data: {json.dumps({'text': chunk.text})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'text': f'(AI Connection Error: {str(e)})'})}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
