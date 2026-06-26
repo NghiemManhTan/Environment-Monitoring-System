@@ -31,9 +31,52 @@ typedef struct struct_message {
 struct_message myData;
 esp_now_peer_info_t peerInfo;
 
+unsigned long lastReadTime = 0;
+unsigned long lastSendTime = 0;
+const long READ_INTERVAL = 200;
+const long SEND_INTERVAL = 2000;
+
+float tempArr[15], humArr[15], luxArr[15], uvArr[15];
+int rainAoArr[15], soilAoArr[15];
+int sumRainDO = 0, sumSoilDO = 0;
+int readCount = 0; 
+
+template <typename T>
+void sortArray(T arr[], int n) {
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = 0; j < n - i - 1; j++) {
+      if (arr[j] > arr[j + 1]) {
+        T temp = arr[j];
+        arr[j] = arr[j + 1];
+        arr[j + 1] = temp;
+      }
+    }
+  }
+}
+
+template <typename T>
+float getTrimmedMean(T arr[], int count) {
+  if (count == 0) return 0;
+  if (count <= 2) {
+    float sum = 0;
+    for (int i = 0; i < count; i++) sum += arr[i];
+    return sum / count;
+  }
+  
+  sortArray(arr, count);
+  
+  int trim = count * 0.2; 
+  float sum = 0;
+  for (int i = trim; i < count - trim; i++) {
+    sum += arr[i];
+  }
+  
+  return sum / (count - 2 * trim);
+}
+
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  Serial.print("\r\nTrạng thái gửi gói tin: ");
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Thành công" : "Thất bại");
+  Serial.print("ESP-NOW Status: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success ✅" : "Failed ❌");
 }
 
 void setup() {
@@ -53,7 +96,7 @@ void setup() {
   WiFi.mode(WIFI_STA);
 
   if (esp_now_init() != ESP_OK) {
-    Serial.println("Lỗi khởi tạo ESP-NOW");
+    Serial.println("Error initializing ESP-NOW");
     return;
   }
 
@@ -64,43 +107,70 @@ void setup() {
   peerInfo.encrypt = false;
 
   if (esp_now_add_peer(&peerInfo) != ESP_OK){
-    Serial.println("Không thể thêm thiết bị nhận");
+    Serial.println("Failed to add peer");
     return;
   }
 
-  Serial.println("Mạch gửi sẵn sàng");
+  Serial.println("\n=== GATE 1 READY (SMART FILTERING MODE) ===");
 }
 
 void loop() {
-  Serial.println("\n==Thông tin cảm biến==");
+  unsigned long currentMillis = millis();
 
-  myData.humidity = dht.readHumidity();
-  myData.temperature = dht.readTemperature();
-  myData.lux = lightMeter.readLightLevel();
-  myData.rainDO = digitalRead(RAIN_DO);
-  myData.rainAO = analogRead(RAIN_AO);
-  myData.soilDO = digitalRead(SOIL_DO);
-  myData.soilAO = analogRead(SOIL_AO);
-  
-  int uvRaw = analogRead(UV_PIN);
-  myData.uvVoltage = uvRaw * 3.3 / 4095.0;
-  
-  //kiểm tra tin hiệu sensors (xóa sau khi kiểm tra)
-  Serial.printf("Nhiệt độ: %.2f C | Độ ẩm: %.2f %%\n", myData.temperature, myData.humidity);
-  Serial.printf("Ánh sáng: %.2f lux\n", myData.lux);
-  Serial.printf("Cảm biến Mưa (AO): %d | Đất (AO): %d\n", myData.rainAO, myData.soilAO);
-  Serial.printf("Điện áp UV: %.2f V\n", myData.uvVoltage);
-  
-  if (isnan(myData.temperature) || isnan(myData.humidity)) {
-    Serial.println("Lỗi đọc cảm biến DHT!");
-  } else {
-    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
-    if (result == ESP_OK) {
-      Serial.println("Đã gửi dữ liệu");
+  if (currentMillis - lastReadTime >= READ_INTERVAL) {
+    lastReadTime = currentMillis;
+
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+
+    if (isnan(t) || isnan(h)) {
+      Serial.println("DHT22 read error, skipping this sample.");
     } else {
-      Serial.println("Lỗi khi gửi dữ liệu");
+      if (readCount < 15) {
+        tempArr[readCount] = t;
+        humArr[readCount] = h;
+        luxArr[readCount] = lightMeter.readLightLevel();
+        rainAoArr[readCount] = analogRead(RAIN_AO);
+        soilAoArr[readCount] = analogRead(SOIL_AO);
+        
+        int uvRaw = analogRead(UV_PIN);
+        uvArr[readCount] = (uvRaw * 3.3 / 4095.0);
+        
+        sumRainDO += digitalRead(RAIN_DO);
+        sumSoilDO += digitalRead(SOIL_DO);
+
+        readCount++;
+        Serial.printf("Collected raw sample #%d...\n", readCount);
+      }
     }
   }
 
-  delay(2000);
+  if (currentMillis - lastSendTime >= SEND_INTERVAL) {
+    lastSendTime = currentMillis;
+
+    if (readCount > 0) {
+      // Đưa các mảng qua hàm lọc Trimmed Mean để lấy dữ liệu lõi tinh khiết
+      myData.temperature = getTrimmedMean(tempArr, readCount);
+      myData.humidity = getTrimmedMean(humArr, readCount);
+      myData.lux = getTrimmedMean(luxArr, readCount);
+      myData.rainAO = (int)getTrimmedMean(rainAoArr, readCount);
+      myData.soilAO = (int)getTrimmedMean(soilAoArr, readCount);
+      myData.uvVoltage = getTrimmedMean(uvArr, readCount);
+
+      myData.rainDO = (sumRainDO * 2 >= readCount) ? 1 : 0;
+      myData.soilDO = (sumSoilDO * 2 >= readCount) ? 1 : 0;
+
+      Serial.println("\n=== PACKAGING AND SENDING CLEAN DATA ===");
+      Serial.printf("Clean Temp: %.2f C | Hum: %.2f %% (Trimmed from %d samples)\n", myData.temperature, myData.humidity, readCount);
+      Serial.printf("Clean RainAO: %d | SoilAO: %d\n", myData.rainAO, myData.soilAO);
+
+      esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
+
+      sumRainDO = 0; 
+      sumSoilDO = 0;
+      readCount = 0;
+    } else {
+      Serial.println("\nNo valid data samples to send in this cycle!");
+    }
+  }
 }
